@@ -12,13 +12,6 @@ pip install -r requirements.txt
 qi login
 ```
 
-
-If login fails, try
-```bash
-python -m pip install --upgrade certifi
-export SSL_CERT_FILE="$(python -c 'import certifi; print(certifi.where())')"
-export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
-```
 Download the Amazon Last Mile Routing Research Challenge training data
 (https://routingchallenge.mit.edu/), unzip it into `data/`, and check that this exists:
 
@@ -62,7 +55,18 @@ cat output/results/summary.md
 | `comparison.csv` | one row per route (all costs, improvements, gaps) |
 | `windows.csv` | one row per window (valid-shot fraction, TVD, regret, job ids, transpiled depth) |
 | `jobs_ledger.csv` | every Quantum Inspire job id |
-| `figures/` | cost bars, route maps (with / without depot), scaling plot (PNG + PDF) |
+| `figures/routes/<route>/` | **one picture per path**, with and without depot: Amazon, OR-Tools, every run (PNG + PDF) |
+| `figures/subroutes/<route>/<run>/` | one picture per QPU window: **blue** = order decoded from the QPU, **red** = part committed to the route (`visualise_subroute` in `config.toml`) |
+| `figures/` | also `cost_comparison__*` bars and `scaling` plot |
+
+## Check that real hardware was used
+
+`main.py` prints `REAL QUANTUM HARDWARE` or `SIMULATION` for every backend and refuses a Quantum Inspire backend that the
+platform does not flag as hardware. To verify a finished experiment against the platform:
+
+```bash
+python scripts/verify_hardware.py
+```
 
 ## Dry run without a QPU (no account needed)
 

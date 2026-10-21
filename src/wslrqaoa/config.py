@@ -20,7 +20,7 @@ DEFAULTS = {
                         "max_job_retries": 3, "optimization_level": 3, "transpile_seed": 7},
     "compare": {"ideal_simulation": True, "exact_window": True, "warm_start_only": True,
                 "nearest_neighbor": True},
-    "output": {"output_dir": "output", "figures": True},
+    "output": {"output_dir": "output", "figures": True, "visualise_subroute": True, "figure_max_routes": 5},
 }
 
 
@@ -86,6 +86,11 @@ def load_config(path: str | Path = "config.toml") -> dict:
         parse_backend(b)
     if not cfg["quantum_inspire"]["backends"]:
         raise ConfigError("quantum_inspire.backends must not be empty")
+    for key in ("figures", "visualise_subroute"):
+        if not isinstance(cfg["output"][key], bool):
+            raise ConfigError(f"output.{key} must be true or false (lowercase, TOML syntax)")
+    if not isinstance(cfg["output"]["figure_max_routes"], int) or cfg["output"]["figure_max_routes"] < 1:
+        raise ConfigError("output.figure_max_routes must be an integer >= 1")
     if cfg["prepare"]["num_routes"] < 1:
         raise ConfigError("prepare.num_routes must be >= 1")
     return cfg

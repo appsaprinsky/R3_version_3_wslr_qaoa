@@ -5,9 +5,10 @@ from qiskit.providers.fake_provider import GenericBackendV2
 
 
 class Server:
-    def __init__(self, fail_first=0, never_ready=False):
+    def __init__(self, fail_first=0, never_ready=False, hardware=True):
         self.jobs, self.next_id, self.calls = {}, 1000, {}
         self.fail_first, self.failed_so_far, self.never_ready = fail_first, 0, False
+        self.hardware = hardware                  # False -> backends report is_hardware=False (an emulator)
 
 
 class FakeResult:
@@ -31,6 +32,13 @@ class FakeJob:
         self.batch_job_id = batch
 
 
+class _BT:
+    def __init__(self, hardware):
+        self.id, self.name, self.is_hardware = 7, "Tuna-fake", hardware
+        self.infrastructure, self.identifier = "fake", "tuna-fake"
+        self.status = type("S", (), {"value": "idle"})()
+
+
 class FakeQIBackend(GenericBackendV2):
     def __init__(self, name, nq, edges, server):
         both = [list(e) for e in edges] + [[b, a] for a, b in edges]
@@ -38,6 +46,9 @@ class FakeQIBackend(GenericBackendV2):
         self.name = name
         self.server = server
         self.max_shots = 8192
+
+    def get_backend_type(self):
+        return _BT(self.server.hardware)
 
     def run(self, circuits, shots=1024, **kw):
         circuits = [circuits] if not isinstance(circuits, list) else circuits
@@ -72,7 +83,18 @@ def install(monkeypatch, server):
             j["polls"] += 1
             st = "failed" if j["fail"] else ("completed" if j["polls"] >= 3 and not server.never_ready else
                                               ("running" if j["polls"] == 2 else "planned"))
-            return type("J", (), {"status": type("S", (), {"value": st})()})()
+            return type("J", (), {"status": type("S", (), {"value": st})(), "batch_job_id": job_id + 5000,
+                                  "created_on": "2026-10-20 06:36:40+00:00", "queued_at": "2026-10-20 06:36:41+00:00",
+                                  "finished_at": "2026-10-20 06:41:10+00:00"})()
+
+        @staticmethod
+        def _invoke(api_class, method_name, *a, **k):
+            b = type("B", (), {"backend_type_id": 7, "backend_id": 3, "queued_at": "2026-10-20 06:36:41+00:00",
+                               "reserved_at": "2026-10-20 06:40:30+00:00", "finished_at": "2026-10-20 06:41:10+00:00"})()
+            return type("P", (), {"items": [b]})()
+
+        def get_backend_type(self, backend_type_id):
+            return _BT(server.hardware)
 
         def get_results(self, job_id):
             j = server.jobs[job_id]

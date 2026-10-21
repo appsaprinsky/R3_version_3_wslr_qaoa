@@ -93,13 +93,29 @@ def test_inconclusive_calibration_stops_run(tmp_path):
         out = orig(jobs, shots)
         for j, o in zip(jobs, out):
             if j["role"] == "calibration":
-                o["result"]["counts"] = {"0101": shots}
+                o["result"]["counts"] = {"0110": shots}
         return out
     gw.submit = bad
     run = [r for r in eng.runs if r["name"] == "sim-Tuna-5"][0]
     for _ in range(3):
         eng.step(run)
     assert run["status"] == "failed" and "calibration" in run["failure"]
+
+
+def test_calibration_decision_with_readout_noise():
+    # 16 qubits: the exact key is only 46% of the shots (as on Tuna-17) but the order is still clear
+    n = 16
+    counts = {"0" * 15 + "1": 470, "0" * 14 + "11": 60, "0" * 13 + "101": 55, "0" * 12 + "1001": 50, "1" + "0" * 14 + "1": 25,
+              "0" * 16: 60, "0" * 15 + "1"[:0] + "0": 0, "0" * 8 + "1" + "0" * 6 + "1": 40, "0" * 10 + "1" + "0" * 4 + "1": 40,
+              "0" * 6 + "1" + "0" * 8 + "1": 40, "0" * 4 + "1" + "0" * 10 + "1": 38, "0" * 2 + "1" + "0" * 12 + "1": 40,
+              "0" * 15 + "0": 106}
+    order, det = E.bit_order_from_calibration(counts)
+    assert order == "qiskit" and det["p_exact_key"] < 0.5
+    rev = {k[::-1]: v for k, v in counts.items()}
+    assert E.bit_order_from_calibration(rev)[0] == "reversed"
+    assert E.bit_order_from_calibration({"0" * 16: 100})[0] is None            # no excitation at all
+    assert E.bit_order_from_calibration({"1" * 16: 100})[0] is None            # everything excited
+    assert E.bit_order_from_calibration({"1" + "0" * 14 + "1": 100})[0] is None  # both ends excited
 
 
 def test_exploration_is_seeded_and_state_based():
@@ -253,3 +269,62 @@ def test_config_rejects_unknown_keys_and_backends(tmp_path):
     cfg = load_config(bad)
     with pytest.raises(ValueError, match="needs 25 qubits"):
         window_size(cfg["qaoa"]["k"], 17)
+
+
+# ------------------------------------------------------------- real-hardware guard, platform info, timing
+def test_emulator_is_refused_on_the_hardware_path(monkeypatch):
+    fakes.install(monkeypatch, fakes.Server(hardware=False))
+    g = QuantumInspireGateway("Tuna-5", load_config(ROOT / "config.toml")["quantum_inspire"])
+    with pytest.raises(RuntimeError, match="NOT confirmed real quantum hardware"):
+        g.connect()
+
+
+def test_hardware_is_recorded_in_backend_info(monkeypatch):
+    fakes.install(monkeypatch, fakes.Server(hardware=True))
+    g = QuantumInspireGateway("Tuna-5", load_config(ROOT / "config.toml")["quantum_inspire"])
+    info = g.connect()
+    assert info["is_hardware"] is True and info["backend_status"] == "idle"
+
+
+def test_platform_info_and_timing_are_recorded(tmp_path, monkeypatch):
+    routes = make_routes(tmp_path)
+    cfg = make_cfg()
+    eng = qi_engine(tmp_path, routes, cfg, monkeypatch, fakes.Server())
+    eng.run_all()
+    run = [r for r in eng.runs if r["name"] == "Tuna-5"][0]
+    w = [x for x in run["windows"] if x.get("job")][0]
+    plat = w["job"]["platform"]
+    assert plat["batch_backend_is_hardware"] is True and plat["batch_backend_type_name"] == "Tuna-fake"
+    assert plat["job_created_on"] and plat["batch_reserved_at"]
+    assert w["job"]["backend_is_hardware"] is True and w["job"]["completed_seen_utc"]
+    tm = run["timing"]
+    assert tm["compute_s"] > 0 and tm["submit_s"] > 0 and tm["first_activity_utc"]
+    for r in eng.runs:                                   # every run, also the classical ones, has a compute time
+        assert r["timing"]["compute_s"] >= 0 and r["status"] == "finished"
+
+
+def test_sim_backend_is_marked_not_hardware(tmp_path):
+    routes = make_routes(tmp_path)
+    eng = sim_engine(tmp_path, routes, make_cfg())
+    assert eng.gws["sim-Tuna-5"].info["is_hardware"] is False
+
+
+def test_verify_hardware_script(tmp_path, monkeypatch):
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import verify_hardware as V
+    import quantuminspire.managers.resource_manager as rm
+    routes = make_routes(tmp_path)
+    cfg = make_cfg()
+    server = fakes.Server()
+    eng = qi_engine(tmp_path, routes, cfg, monkeypatch, server)
+    eng.run_all()
+    runs = V.collect(tmp_path / "qi")
+    assert runs
+    off = V.offline_report(runs)
+    assert all(r["all_job_ids_are_integers"] and not r["any_simulator_id"] and r["sum_exec_time_s"] > 0 for r in off)
+    rows, err = V.platform_report(runs, rm.ResourceManager)
+    assert err is None and rows and all(r["is_hardware"] is True for r in rows)
+    server.hardware = False
+    rows, err = V.platform_report(runs, rm.ResourceManager)
+    assert all(r["is_hardware"] is False for r in rows)

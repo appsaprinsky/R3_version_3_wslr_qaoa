@@ -34,7 +34,7 @@ ramp_grid    = 7          # grid points per axis before COBYLA
 ramp_maxiter = 100        # COBYLA iterations
 
 [quantum_inspire]
-backends = ["Tuna-17"]   # prefix with "sim:" (e.g. "sim:Tuna-9") for a local simulation ["Tuna-5", "Tuna-9", "Tuna-17"]
+backends = ["Tuna-17"]   # prefix with "sim:" (e.g. "sim:Tuna-9") for a local simulation ["Tuna-5", "Tuna-9", "Tuna-17"] 
 poll_interval_s  = 30     # seconds between status checks; main.py never gives up waiting
 max_job_retries  = 3      # resubmissions of a failed/cancelled job
 optimization_level = 3    # transpiler settings as in the reference script
@@ -49,3 +49,6 @@ nearest_neighbor = true   # nearest neighbour + 2-opt (window size 1)
 [output]
 output_dir = "output"
 figures    = true
+visualise_subroute = true   # true: one picture per QPU window (blue = order decoded from the QPU, red = part committed)
+                            # false: skip them (TOML booleans are lowercase)
+figure_max_routes  = 15      # route and sub-route pictures are made for the first N routes only (cost bars for all)

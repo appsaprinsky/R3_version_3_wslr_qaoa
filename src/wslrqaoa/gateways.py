@@ -57,12 +57,26 @@ class QuantumInspireGateway:
         if not match:
             raise RuntimeError(f"Backend '{self.name}' not found on Quantum Inspire. Available: {names}")
         self.backend = match[0]
+        # ---- hard guard: only REAL hardware is accepted on this path (emulators must be requested as "sim:...")
+        try:
+            bt = self.backend.get_backend_type()
+        except Exception as e:                                       # noqa: BLE001
+            raise RuntimeError(f"Could not confirm that '{self.name}' is real quantum hardware "
+                               f"({type(e).__name__}: {e}). Refusing to run.") from e
+        is_hw = getattr(bt, "is_hardware", None)
+        if is_hw is not True:
+            raise RuntimeError(f"Backend '{self.backend.name}' on Quantum Inspire is NOT confirmed real quantum hardware "
+                               f"(is_hardware={is_hw}). Refusing to run: choose Tuna-5, Tuna-9 or Tuna-17.")
+        status = getattr(bt, "status", None)
         cmap = getattr(self.backend, "coupling_map", None)
         edges = sorted({tuple(sorted(e)) for e in cmap.get_edges()}) if cmap is not None else []
         self.info = {"name": self.backend.name, "qubits": int(self.backend.num_qubits),
                      "coupling_edges": [list(e) for e in edges],
                      "operation_names": sorted(self.backend.operation_names),
                      "max_shots": int(getattr(self.backend, "max_shots", 0) or 0),
+                     "is_hardware": True, "backend_type_id": getattr(bt, "id", None),
+                     "infrastructure": getattr(bt, "infrastructure", None), "identifier": getattr(bt, "identifier", None),
+                     "backend_status": str(getattr(status, "value", status)).lower(),
                      "retrieved_utc": _utc()}
         return self.info
 
@@ -138,7 +152,39 @@ class QuantumInspireGateway:
         meta = {f: (str(getattr(result, f)) if f == "created_on" else getattr(result, f))
                 for f in ("id", "job_id", "created_on", "execution_time_in_seconds", "shots_requested", "shots_done")
                 if hasattr(result, f)}
+        meta["platform"] = self._platform_info(job_id)
         return {"counts": counts, "meta": meta}
+
+    def _platform_info(self, job_id) -> dict:
+        """Platform-side evidence and timestamps of one job (best effort; never raises).
+        job: created_on / queued_at / finished_at.  batch: backend type (+ is_hardware), queued / reserved / finished."""
+        from quantuminspire.managers.resource_manager import ResourceManager
+        info: dict = {}
+        batch_id = None
+        try:
+            job = ResourceManager().get_job(int(job_id))
+            batch_id = getattr(job, "batch_job_id", None)
+            info.update({"job_created_on": str(getattr(job, "created_on", None)),
+                         "job_queued_at": str(getattr(job, "queued_at", None)),
+                         "job_finished_at": str(getattr(job, "finished_at", None)),
+                         "batch_job_id": batch_id})
+        except Exception as e:                                       # noqa: BLE001
+            info["job_lookup_error"] = f"{type(e).__name__}: {e}"
+        if batch_id is not None:
+            try:
+                from compute_api_client import BatchJobsApi
+                page = ResourceManager._invoke(BatchJobsApi, "read_batch_jobs_batch_jobs_get", id=int(batch_id))
+                b = page.items[0]
+                bt = ResourceManager().get_backend_type(b.backend_type_id)
+                info.update({"batch_backend_type_id": b.backend_type_id, "batch_backend_id": getattr(b, "backend_id", None),
+                             "batch_backend_type_name": getattr(bt, "name", None),
+                             "batch_backend_is_hardware": getattr(bt, "is_hardware", None),
+                             "batch_queued_at": str(getattr(b, "queued_at", None)),
+                             "batch_reserved_at": str(getattr(b, "reserved_at", None)),
+                             "batch_finished_at": str(getattr(b, "finished_at", None))})
+            except Exception as e:                                   # noqa: BLE001
+                info["batch_lookup_error"] = f"{type(e).__name__}: {e}"
+        return info
 
 
 class SimGateway:
@@ -149,7 +195,7 @@ class SimGateway:
     def __init__(self, name: str, qubits: int, seed: int = 2026, reverse_bits: bool = False):
         self.name, self.qubits, self.seed, self.reverse_bits = name, qubits, seed, reverse_bits
         self.info = {"name": f"sim:{name}", "qubits": qubits, "coupling_edges": [], "operation_names": [],
-                     "max_shots": 100000, "retrieved_utc": _utc()}
+                     "max_shots": 100000, "is_hardware": False, "backend_status": "simulation", "retrieved_utc": _utc()}
         self._n = 0
 
     def connect(self) -> dict:

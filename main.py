@@ -69,7 +69,12 @@ def main() -> int:
                 print(f"  WARNING: platform reports {info['qubits']} qubits for {base} (expected {qubits}); using {info['qubits']}.")
             gw.k = window_size(cfg["qaoa"]["k"], info["qubits"])
             gws[label], infos[label] = gw, info
-            print(f"  {info['name']}: {info['qubits']} qubits -> window size k = {gw.k} ({gw.k ** 2} qubits used)")
+            kind = (f"REAL QUANTUM HARDWARE (platform is_hardware = True, status: {info.get('backend_status')})"
+                    if info.get("is_hardware") else "SIMULATION - NOT a quantum computer")
+            print(f"  {info['name']}: {info['qubits']} qubits -> window size k = {gw.k} ({gw.k ** 2} qubits used)\n"
+                  f"  -> {kind}")
+            if info.get("is_hardware") and info.get("backend_status") in ("offline", "maintenance"):
+                print(f"  WARNING: backend status is '{info['backend_status']}'; jobs will wait until it is available.")
     except AuthError as e:
         print(f"ERROR: {e}")
         return 1

@@ -22,11 +22,38 @@ def _now() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class _Timed:
+    """Transparent proxy that adds the time spent in gateway calls to a shared clock:
+    submit (transpile + upload) and poll (status + fetch). Everything else is forwarded unchanged."""
+
+    def __init__(self, gw, clock: dict):
+        self._gw, self._clock = gw, clock
+
+    def __getattr__(self, name):
+        attr = getattr(self._gw, name)
+        bucket = {"submit": "submit", "status": "poll", "fetch": "poll"}.get(name)
+        if bucket is None or not callable(attr):
+            return attr
+
+        def wrapped(*a, **k):
+            t = time.perf_counter()
+            try:
+                return attr(*a, **k)
+            finally:
+                self._clock[bucket] += time.perf_counter() - t
+        return wrapped
+
+
 class Engine:
     def __init__(self, cfg: dict, routes: list[dict], gateways: dict, out_dir: Path, log=print):
         self.cfg, self.q, self.qi = cfg, cfg["qaoa"], cfg["quantum_inspire"]
         self.routes = {r["route_id"]: r for r in routes}
-        self.gws = gateways                       # label -> gateway
+        self._clock = {"submit": 0.0, "poll": 0.0}          # seconds spent inside gateway calls
+        self.gws = {k: _Timed(g, self._clock) for k, g in gateways.items()}    # label -> gateway
         self.out = Path(out_dir)
         self.log = lambda m: log(f"[{_now()}] {m}")
         self.runs: list[dict] = []
@@ -49,6 +76,7 @@ class Engine:
                 "backend": backend, "label": label, "k": k, "p": p, "b": b, "status": "running",
                 "state": heuristic.initial_state(n), "pending": None, "bit_order": None,
                 "windows": [], "result": None, "failure": None,
+                "timing": {"compute_s": 0.0, "submit_s": 0.0, "poll_s": 0.0, "first_activity_utc": None},
                 "windows_total": int(np.ceil((n - 1) / b)) if n > 1 else 0}
 
     def create_runs(self) -> None:
@@ -104,6 +132,27 @@ class Engine:
 
     # ------------------------------------------------------------------ one step of one run
     def step(self, run) -> bool:
+        """One step of one run, with timing. compute_s = time in this program's own computation (candidate selection,
+        LP, angle optimisation on the exact simulator, circuit building, decoding, 2-opt) -- it excludes time inside
+        gateway calls (submit_s: transpile + upload, poll_s: status/fetch) and, of course, all waiting."""
+        if run["status"] != "running":
+            return False
+        tm = run.setdefault("timing", {"compute_s": 0.0, "submit_s": 0.0, "poll_s": 0.0, "first_activity_utc": None})
+        tm.setdefault("first_activity_utc", None)
+        if tm["first_activity_utc"] is None:
+            tm["first_activity_utc"] = _utc_now()
+        t0, c0 = time.perf_counter(), dict(self._clock)
+        progressed = self._step(run)
+        d_sub, d_poll = self._clock["submit"] - c0["submit"], self._clock["poll"] - c0["poll"]
+        tm["submit_s"] += d_sub
+        tm["poll_s"] += d_poll
+        tm["compute_s"] += max(time.perf_counter() - t0 - d_sub - d_poll, 0.0)
+        tm["last_activity_utc"] = _utc_now()
+        if progressed:
+            self.save(run)
+        return progressed
+
+    def _step(self, run) -> bool:
         if run["status"] != "running":
             return False
         route = self.routes[run["route_id"]]
@@ -183,6 +232,7 @@ class Engine:
                     res = gw.fetch(job["job_id"])
                     if res:
                         job["result"], job["done"], changed = res, True, True
+                        job["completed_seen_utc"] = _utc_now()
                 elif st in ("failed", "cancelled"):
                     self._resubmit(run, job, st)
                     changed = True
@@ -250,7 +300,10 @@ class Engine:
                         "submitted_utc": wj["submitted_utc"], "shots": wj["shots"], "transpiled": wj["transpiled"],
                         "execution_time_s": meta.get("execution_time_in_seconds"), "shots_done": meta.get("shots_done"),
                         "created_on": meta.get("created_on"), "history": wj["history"],
-                        "backend": self.gws[run["label"]].info["name"], "error_mitigation": "none"},
+                        "completed_seen_utc": wj.get("completed_seen_utc"), "platform": meta.get("platform"),
+                        "backend": self.gws[run["label"]].info["name"],
+                        "backend_is_hardware": self.gws[run["label"]].info.get("is_hardware"),
+                        "error_mitigation": "none"},
                 "n_qubits": win.n, "bit_order": run["bit_order"]}
         run["pending"] = None
         self._commit(run, pend["spec"], d["order"], info)
