@@ -1,0 +1,12 @@
+# Python >= 3.11 (uses tomllib). Tested with the versions in the comments.
+numpy>=1.26            # 2.4.4
+scipy>=1.11            # 1.17.1  (HiGHS LP)
+pandas>=2.0            # 3.0.2
+matplotlib>=3.7        # 3.10.8
+ortools>=9.8           # 9.15  (CP-SAT baseline)
+qiskit>=2.0            # 2.6.0
+qiskit-quantuminspire>=0.18   # 0.18.5
+quantuminspire>=4.1    # 4.1.0 (ResourceManager, as in the reference retrieval script)
+# only for the tests:
+qiskit-aer>=0.15       # 0.17.2
+pytest>=8

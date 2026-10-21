@@ -1,0 +1,51 @@
+# ============================================================================
+#  config.toml -- the only place where parameters are set.
+#  prepare_input.py reads [prepare]; main.py reads [qaoa], [quantum_inspire],
+#  [compare] and [output]. Unknown keys are rejected.
+# ============================================================================
+
+[prepare]
+data_dir   = "data/almrrc2021-data-training"  # folder that contains (or contains model_build_inputs/ with)
+                                              # route_data.json, travel_times.json, actual_sequences.json
+input_dir  = "input"
+num_routes = 1            # how many random Amazon routes to use
+seed       = 2026         # seed of the random route selection (reproducible)
+min_stops  = 0            # optional filter on the number of stops incl. depot (0 = off)
+max_stops  = 0            # e.g. 40 keeps the first run short (0 = off)
+ortools_time_limit_s = 120   # OR-Tools CP-SAT time limit per route
+ortools_workers      = 8
+
+[qaoa]
+k          = "auto"       # window size; "auto" = largest k with k^2 <= qubits (Tuna-5: 2, Tuna-9: 3, Tuna-17: 4)
+p          = 2            # number of QAOA layers (ramp has 2 free parameters for any p)
+batch_size = 0            # nodes committed per window (b <= k); 0 = k
+exploration = 0.0         # fraction of window candidates drawn at random instead of nearest
+shots      = 1024
+seed       = 2026
+penalty_lambda = 1.5      # P = lambda * k * max edge cost of the window (must be > 1)
+epsilon    = 0.25         # warm-start regularisation: LP solution clipped to [eps, 1-eps]; 0.5 = no warm start
+decode_rule = "marginal"   # "marginal": order maximising the summed marginals; "best_valid": cheapest valid sampled permutation
+lp_cost    = "surrogate"  # "surrogate" (linear surrogate cost) or "linearized" (LP relaxation of the quadratic cost)
+ramp_mode  = "optimize"   # "optimize": tune (delta_gamma, delta_beta) per window on the exact simulator
+                          # "fixed":    use delta_gamma / delta_beta below, no simulation needed
+delta_gamma = 1.0
+delta_beta  = 1.0
+ramp_grid    = 7          # grid points per axis before COBYLA
+ramp_maxiter = 100        # COBYLA iterations
+
+[quantum_inspire]
+backends = ["Tuna-17"]   # prefix with "sim:" (e.g. "sim:Tuna-9") for a local simulation ["Tuna-5", "Tuna-9", "Tuna-17"]
+poll_interval_s  = 30     # seconds between status checks; main.py never gives up waiting
+max_job_retries  = 3      # resubmissions of a failed/cancelled job
+optimization_level = 3    # transpiler settings as in the reference script
+transpile_seed     = 7
+
+[compare]                 # classical counterparts that run locally at the same k
+ideal_simulation = true   # same algorithm, exact circuit probabilities instead of device counts
+exact_window     = true   # each window solved exactly (brute force) instead of by QAOA
+warm_start_only  = true   # decode the warm start itself (no QAOA layers): what does the QAOA add?
+nearest_neighbor = true   # nearest neighbour + 2-opt (window size 1)
+
+[output]
+output_dir = "output"
+figures    = true

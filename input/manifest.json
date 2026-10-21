@@ -1,0 +1,19 @@
+{
+ "schema_version": 1,
+ "created_utc": "2026-10-19T01:24:04+00:00",
+ "seed": 2026,
+ "num_routes": 1,
+ "min_stops": 0,
+ "max_stops": 0,
+ "route_ids": [
+  "RouteID_7c36b9b2-3084-46eb-9b45-0309ec4b0d19"
+ ],
+ "skipped": [],
+ "raw_dir": "data/almrrc2021-data-training/model_build_inputs",
+ "raw_sha256": {
+  "route_data.json": "da3a5d4e73b683d756111f0d9e6d3f20eb8e82adf7c89ee6ee0cb2239abd2f38",
+  "travel_times.json": "0023d7517380f15b611d77bc0f8a41a1b89459c7c12c37e88981ea16a2b99e2d",
+  "actual_sequences.json": "3de44067242e8fa841d4b852db8809afaa23fe852e452ee4a2f54f0f0fb77e3c"
+ },
+ "python": "3.13.0"
+}

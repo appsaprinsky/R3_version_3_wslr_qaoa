@@ -1,3 +1,8 @@
+data/
+output/
+documentation/paper.pdf
+documentation/paper.tex
+.DS_Store
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
