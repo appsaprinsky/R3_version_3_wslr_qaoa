@@ -7,7 +7,7 @@ documentation/paper.tex
 __pycache__/
 *.py[codz]
 *$py.class
-
+venv/
 # C extensions
 *.so
 

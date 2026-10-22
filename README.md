@@ -11,6 +11,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 qi login
 ```
+If login fails, try
+```bash
+python -m pip install --upgrade certifi
+export SSL_CERT_FILE="$(python -c 'import certifi; print(certifi.where())')"
+export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
+```
 
 Download the Amazon Last Mile Routing Research Challenge training data
 (https://routingchallenge.mit.edu/), unzip it into `data/`, and check that this exists:
