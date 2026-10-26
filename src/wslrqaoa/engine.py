@@ -1,19 +1,20 @@
 """Experiment engine: runs = (route x algorithm variant). State lives in output/runs/*.json, so the
 program can be stopped at any time and `python main.py` resumes where it left off.
 
-Run modes
-  qpu    LRWS-QAOA windows sampled on a Quantum Inspire backend (or local 'sim:' sampler)
-  ideal  same algorithm with exact circuit probabilities (no device)
-  exact  every window solved exactly (brute force)               -- classical-window ablation
-  warm   decode the warm start only (no QAOA layers)             -- what does the QAOA add?
-  nn     nearest neighbour (window size 1) + 2-opt
+Approaches (one Engine and one output folder each)
+  ORtoolsOutput            mode ortools_full : the whole route solved by CP-SAT (baseline, no start solution)
+  AlgorithmWithORtoolCore  mode ortools_core : my algorithm; every window solved by CP-SAT (same k, b, candidates, 2-opt)
+  AlgorithmWithQC          mode qpu          : my algorithm; every window sampled on Tuna-17 (or a local 'sim:' sampler)
+                           plus optional controls: ideal (exact circuit probabilities), exact (brute force),
+                           warm (decode the warm start only), nn (nearest neighbour + 2-opt)
 """
 from __future__ import annotations
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
-from . import heuristic, routing, window as W, circuit as CIR
+from . import heuristic, routing, window as W, circuit as CIR, ortools_solver
+from .config import algorithm_window
 from .gateways import AuthError
 from .io_utils import write_json_atomic, read_json
 
@@ -48,11 +49,23 @@ class _Timed:
         return wrapped
 
 
+def _new_timing() -> dict:
+    """compute_s: own computation; submit_s/poll_s: Quantum Inspire calls; subsolver_s: time inside CP-SAT;
+    cpu_s: process CPU time (all threads); diag_s: diagnostics excluded from the run (CP-SAT check of QC windows,
+    2-opt sensitivity of the baseline)."""
+    return {"compute_s": 0.0, "submit_s": 0.0, "poll_s": 0.0, "subsolver_s": 0.0, "cpu_s": 0.0, "diag_s": 0.0,
+            "first_activity_utc": None}
+
+
 class Engine:
-    def __init__(self, cfg: dict, routes: list[dict], gateways: dict, out_dir: Path, log=print):
+    def __init__(self, cfg: dict, routes: list[dict], gateways: dict, out_dir: Path, log=print,
+                 approach: str = "AlgorithmWithQC"):
         self.cfg, self.q, self.qi = cfg, cfg["qaoa"], cfg["quantum_inspire"]
+        self.full, self.core = cfg["ortools_full"], cfg["ortools_core"]
+        self.approach = approach
         self.routes = {r["route_id"]: r for r in routes}
-        self._clock = {"submit": 0.0, "poll": 0.0}          # seconds spent inside gateway calls
+        # seconds spent inside: gateway calls (submit, poll), the subsolver (OR-Tools), diagnostics (excluded from timing)
+        self._clock = {"submit": 0.0, "poll": 0.0, "subsolver": 0.0, "diag": 0.0, "diag_cpu": 0.0}
         self.gws = {k: _Timed(g, self._clock) for k, g in gateways.items()}    # label -> gateway
         self.out = Path(out_dir)
         self.log = lambda m: log(f"[{_now()}] {m}")
@@ -70,16 +83,22 @@ class Engine:
 
     def _new_run(self, route_id, name, mode, k, p, backend=None, label=None) -> dict:
         n = self.routes[route_id]["n_nodes"]
-        b = 1 if mode == "nn" else (self.q["batch_size"] or k)
+        b = 1 if mode in ("nn", "ortools_full") else (self.q["batch_size"] or k)
         b = min(b, k)
         return {"schema_version": 1, "route_id": route_id, "name": name, "key": f"{route_id}/{name}", "mode": mode,
                 "backend": backend, "label": label, "k": k, "p": p, "b": b, "status": "running",
                 "state": heuristic.initial_state(n), "pending": None, "bit_order": None,
                 "windows": [], "result": None, "failure": None,
-                "timing": {"compute_s": 0.0, "submit_s": 0.0, "poll_s": 0.0, "first_activity_utc": None},
-                "windows_total": int(np.ceil((n - 1) / b)) if n > 1 else 0}
+                "timing": _new_timing(), "approach": self.approach,
+                "windows_total": 1 if mode == "ortools_full" else (int(np.ceil((n - 1) / b)) if n > 1 else 0)}
 
     def create_runs(self) -> None:
+        if self.approach == "ORtoolsOutput":
+            self._create_simple_runs("ortools_full", "ortools_full", 1)
+            return
+        if self.approach == "AlgorithmWithORtoolCore":
+            self._create_simple_runs("ortools_core", "ortools_core", algorithm_window(self.cfg)[0])
+            return
         comp = self.cfg["compare"]
         names = set()
         for rid in self.routes:
@@ -103,6 +122,30 @@ class Engine:
                 self.runs.append(read_json(path) if path.exists() else self._new_run(rid, name, mode, k, p, backend, label))
         for r in self.runs:
             self.save(r)
+
+    def _create_simple_runs(self, name: str, mode: str, k: int) -> None:
+        for rid in self.routes:
+            path = self.out / "runs" / f"{rid}__{name}.json"
+            self.runs.append(read_json(path) if path.exists() else self._new_run(rid, name, mode, k, 0))
+        for r in self.runs:
+            self.save(r)
+
+    # ------------------------------------------------------------------ helpers for timing
+    def _timed(self, bucket: str, fn, *a, **k):
+        t = time.perf_counter()
+        try:
+            return fn(*a, **k)
+        finally:
+            self._clock[bucket] += time.perf_counter() - t
+
+    def _diag(self, fn, *a, **k):
+        """Diagnostic work that is not part of the approach: its wall and CPU time are excluded from the run timing."""
+        t, c = time.perf_counter(), time.process_time()
+        try:
+            return fn(*a, **k)
+        finally:
+            self._clock["diag"] += time.perf_counter() - t
+            self._clock["diag_cpu"] += time.process_time() - c
 
     # ------------------------------------------------------------------ main loop
     def run_all(self) -> None:
@@ -137,16 +180,20 @@ class Engine:
         gateway calls (submit_s: transpile + upload, poll_s: status/fetch) and, of course, all waiting."""
         if run["status"] != "running":
             return False
-        tm = run.setdefault("timing", {"compute_s": 0.0, "submit_s": 0.0, "poll_s": 0.0, "first_activity_utc": None})
-        tm.setdefault("first_activity_utc", None)
+        tm = run.setdefault("timing", _new_timing())
+        for key, v in _new_timing().items():
+            tm.setdefault(key, v)
         if tm["first_activity_utc"] is None:
             tm["first_activity_utc"] = _utc_now()
-        t0, c0 = time.perf_counter(), dict(self._clock)
+        t0, cpu0, c0 = time.perf_counter(), time.process_time(), dict(self._clock)
         progressed = self._step(run)
-        d_sub, d_poll = self._clock["submit"] - c0["submit"], self._clock["poll"] - c0["poll"]
-        tm["submit_s"] += d_sub
-        tm["poll_s"] += d_poll
-        tm["compute_s"] += max(time.perf_counter() - t0 - d_sub - d_poll, 0.0)
+        d = {key: self._clock[key] - c0[key] for key in self._clock}
+        tm["submit_s"] += d["submit"]
+        tm["poll_s"] += d["poll"]
+        tm["subsolver_s"] += d["subsolver"]
+        tm["diag_s"] += d["diag"]
+        tm["compute_s"] += max(time.perf_counter() - t0 - d["submit"] - d["poll"] - d["subsolver"] - d["diag"], 0.0)
+        tm["cpu_s"] += max(time.process_time() - cpu0 - d["diag_cpu"], 0.0)
         tm["last_activity_utc"] = _utc_now()
         if progressed:
             self.save(run)
@@ -157,6 +204,8 @@ class Engine:
             return False
         route = self.routes[run["route_id"]]
         C = route["C"]
+        if run["mode"] == "ortools_full":
+            return self._step_ortools_full(run, C)
         if run["pending"] is not None:
             return self._poll(run, route)
         spec = heuristic.plan_step(run["state"], C, run["k"], run["b"], self.q["exploration"], self.q["seed"], run["key"])
@@ -167,7 +216,17 @@ class Engine:
             return True
         M = heuristic.window_matrix(C, spec)
         mode = run["mode"]
-        if mode == "exact":
+        if mode == "ortools_core":
+            res = self._timed("subsolver", ortools_solver.solve_window, M, self.core["window_time_limit_s"],
+                              self.core["cost_scale"], self.core["workers"], self.core["seed"])
+            if res["status"] != "OPTIMAL" or res["order"] is None:
+                run["status"], run["failure"] = "failed", (f"CP-SAT did not prove the window optimal "
+                                                          f"(status {res['status']}, window {run['state']['iteration'] + 1})")
+                self.log(f"ATTENTION {run['name']}: {run['failure']}")
+                return True
+            self._commit(run, spec, res["order"], {"mode": "ortools_core", "ortools_status": res["status"],
+                                                   "ortools_solver_wall_s": res["solver_wall_s"]})
+        elif mode == "exact":
             order = routing.exact_window_order(M)
             self._commit(run, spec, order, {"mode": "exact"})
         elif mode == "nn":
@@ -183,6 +242,30 @@ class Engine:
             self._commit(run, spec, d["order"], {"mode": "ideal", "angles": ang, **_slim(d)})
         else:
             return self._submit(run, spec, M)
+        return True
+
+    # ------------------------------------------------------------------ ORtoolsOutput: the whole route by CP-SAT
+    def _step_ortools_full(self, run, C) -> bool:
+        f = self.full
+        res = self._timed("subsolver", ortools_solver.solve_open_tsp, C, 0, f["time_limit_s"], f["workers"], None,
+                          f["cost_scale"], f["seed"], f["relative_gap_limit"], True)
+        if res["tour"] is None:
+            run["status"], run["failure"] = "failed", f"CP-SAT returned no solution (status {res['status']})"
+            self.log(f"ATTENTION {run['name']}: {run['failure']}")
+            return True
+        tour = res["tour"]
+        assert sorted(tour) == list(range(len(C))) and tour[0] == 0, "OR-Tools tour is not a valid open route"
+        two = self._diag(routing.two_opt, C, tour)                         # sensitivity only, not part of the baseline
+        run["result"] = {"tour": tour, "cost": res["cost"], "tour_pre_2opt": tour, "cost_pre_2opt": res["cost"],
+                         "tour_with_2opt": two, "cost_with_2opt": routing.open_cost(C, two)}
+        run["ortools"] = {k: res[k] for k in ("status", "optimal", "lower_bound", "gap_pct", "solver_wall_s",
+                                              "solver_user_s", "wall_time_s", "trace")}
+        run["ortools"].update({"time_limit_s": f["time_limit_s"], "workers": f["workers"], "seed": f["seed"],
+                               "relative_gap_limit": f["relative_gap_limit"], "cost_scale": f["cost_scale"],
+                               "hint": "none"})
+        run["status"] = "finished"
+        self.log(f"ORtoolsOutput: route {run['route_id'][:18]}: cost {res['cost']:.1f} ({res['status']}, lower bound "
+                 f"{res['lower_bound']:.1f}, {res['solver_wall_s']:.1f} s); Amazon {self.routes[run['route_id']]['amazon_cost']:.1f}")
         return True
 
     # ------------------------------------------------------------------ qpu path
@@ -317,6 +400,13 @@ class Engine:
                "commit": spec["commit"], "order": order, "window_cost": routing.window_order_cost(M, order),
                "exact_cost": routing.window_order_cost(M, routing.exact_window_order(M)) if spec["k"] > 1 else 0.0,
                **info}
+        if run["mode"] == "qpu" and self.core["verify_qc_windows"] and spec["k"] > 1:
+            v = self._diag(ortools_solver.solve_window, M, self.core["window_time_limit_s"], self.core["cost_scale"],
+                           self.core["workers"], self.core["seed"])
+            rec["ortools_window_cost"] = v["cost"]
+            rec["ortools_window_status"] = v["status"]
+            rec["ortools_matches_bruteforce"] = (v["cost"] is not None and
+                                                 abs(v["cost"] - rec["exact_cost"]) <= spec["k"] / self.core["cost_scale"] + 1e-9)
         run["windows"].append(rec)
         run["state"] = heuristic.apply_order(run["state"], spec, order)
         self.save(run)
@@ -330,6 +420,9 @@ class Engine:
         assert sorted(tour) == list(range(len(C))) and tour[0] == 0, "final tour is not a valid open route"
         run["result"], run["status"] = res, "finished"
         self.save(run)
+        if run["mode"] == "ortools_core":
+            self.log(f"AlgorithmWithORtoolCore: route {run['route_id'][:18]}: cost {res['cost']:.1f} "
+                     f"(before 2-opt {res['cost_pre_2opt']:.1f}); Amazon {self.routes[run['route_id']]['amazon_cost']:.1f}")
         if run["mode"] == "qpu":
             self.log(f"{run['label']}: FINISHED route {run['route_id'][:18]}: cost {res['cost']:.1f} "
                      f"(before 2-opt {res['cost_pre_2opt']:.1f}); Amazon {self.routes[run['route_id']]['amazon_cost']:.1f}")

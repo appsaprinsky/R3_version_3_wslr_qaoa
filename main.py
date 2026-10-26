@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 """Step 2: run the experiment.  Usage: python main.py
 
-Reads input/ (made by prepare_input.py) and config.toml. Submits the windows to the Quantum Inspire QPUs,
-waits (polls) until the jobs return, advances the algorithm and writes the results to output/results/.
+Runs the approaches listed in config.toml [experiment] one after another (never at the same time, so the timings are not
+disturbed), each on the same routes from input/ and each with its own folder and state:
+
+  <output_dir>/ORtoolsOutput/            the whole route solved by OR-Tools CP-SAT
+  <output_dir>/AlgorithmWithORtoolCore/  my algorithm, every window solved by OR-Tools CP-SAT
+  <output_dir>/AlgorithmWithQC/          my algorithm, every window sampled on the Tuna-17 quantum computer
+  <output_dir>/Comparison/               paired tables, statistics, figures across the approaches
+
 Everything is saved after every step: if you stop it (Ctrl+C, closed laptop), run `python main.py` again.
+A finished approach is not recomputed; routes added to input/ later are added to every approach.
 """
+import math
 import platform
 import sys
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-from wslrqaoa import report
-from wslrqaoa.config import ConfigError, load_config, parse_backend, run_fingerprint, window_size
+from wslrqaoa import experiment, report
+from wslrqaoa.config import ConfigError, algorithm_window, approach_fingerprint, load_config, parse_backend, window_size
 from wslrqaoa.engine import Engine
 from wslrqaoa.gateways import AuthError, QuantumInspireGateway, SimGateway
-from wslrqaoa.io_utils import input_fingerprint, load_routes, read_json, write_json_atomic
+from wslrqaoa.io_utils import load_routes, read_json, route_hashes, write_json_atomic
 
 
 def versions():
@@ -29,64 +38,118 @@ def versions():
     return out
 
 
-def main() -> int:
-    try:
-        cfg = load_config("config.toml")
-        routes = load_routes(cfg["prepare"]["input_dir"])
-    except (ConfigError, FileNotFoundError) as e:
-        print(f"ERROR: {e}")
-        return 1
-    out = Path(cfg["output"]["output_dir"])
-    exp_path = out / "experiment.json"
-    fp, ifp = run_fingerprint(cfg), input_fingerprint(cfg["prepare"]["input_dir"])
-    if exp_path.exists():
-        exp = read_json(exp_path)
-        if exp["run_fingerprint"] != fp or exp["input_fingerprint"] != ifp:
-            print("ERROR: config.toml or input/ changed since this experiment was started.\n"
-                  f"Restore the old settings to resume, or delete '{out}/' to start a new experiment.")
-            return 1
-    else:
-        exp = {"schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-               "run_fingerprint": fp, "input_fingerprint": ifp, "versions": versions()}
+def settings_for(cfg, approach):
+    """The configuration sections that define one approach (stored with its results for provenance)."""
+    if approach == "ORtoolsOutput":
+        return {"ortools_full": cfg["ortools_full"]}
+    k, b = algorithm_window(cfg)
+    if approach == "AlgorithmWithORtoolCore":
+        return {"k": k, "b": b, "exploration": cfg["qaoa"]["exploration"], "seed": cfg["qaoa"]["seed"], "ortools_core": cfg["ortools_core"]}
+    return {"qaoa": cfg["qaoa"], "quantum_inspire": cfg["quantum_inspire"], "compare": cfg["compare"], "ortools_core": cfg["ortools_core"]}
 
-    try:                                                   # fail fast on an impossible window size
-        for name in cfg["quantum_inspire"]["backends"]:
-            window_size(cfg["qaoa"]["k"], parse_backend(name)[1])
+
+def check_experiment_file(cfg, approach, out, hashes):
+    """Create or validate <out>/experiment.json. Settings must not change once an approach has started; routes may be
+    added, but an existing route file must not change."""
+    path = out / "experiment.json"
+    fp = approach_fingerprint(cfg, approach)
+    if path.exists():
+        exp = read_json(path)
+        if exp["fingerprint"] != fp:
+            raise ConfigError(f"The settings of {approach} changed since it was started. Restore the old config.toml values, "
+                              f"or delete '{out}/' to start this approach again.")
+        changed = [rid for rid, h in hashes.items() if rid in exp["route_hashes"] and exp["route_hashes"][rid] != h]
+        if changed:
+            raise ConfigError(f"Route file(s) changed since {approach} was started: {changed[:3]}. Restore input/ or delete '{out}/'.")
+        exp["route_hashes"].update(hashes)
+    else:
+        exp = {"schema_version": 2, "approach": approach, "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+               "fingerprint": fp, "route_hashes": dict(hashes), "settings": settings_for(cfg, approach), "versions": versions()}
+    write_json_atomic(path, exp)
+
+
+def qc_labels(cfg):
+    base, qubits, is_sim = parse_backend(cfg["quantum_inspire"]["backends"][0])
+    return base, qubits, is_sim, (f"sim-{base}" if is_sim else base)
+
+
+def qc_all_finished(cfg, routes, out) -> bool:
+    """True if every AlgorithmWithQC run of every route is already finished (then no connection is needed)."""
+    _, _, _, label = qc_labels(cfg)
+    k, _ = algorithm_window(cfg)
+    p, comp = cfg["qaoa"]["p"], cfg["compare"]
+    names = [label] + ([f"ideal_k{k}_p{p}"] if comp["ideal_simulation"] else []) + ([f"exact_k{k}"] if comp["exact_window"] else []) \
+        + ([f"warm_k{k}"] if comp["warm_start_only"] else []) + (["nn"] if comp["nearest_neighbor"] else [])
+    for r in routes:
+        for nm in names:
+            f = out / "runs" / f"{r['route_id']}__{nm}.json"
+            if not f.exists() or read_json(f).get("status") != "finished":
+                return False
+    return (out / "backends.json").exists()
+
+
+def connect_qc(cfg, out):
+    """Connect to Tuna-17 (or the local 'sim:' sampler). Returns ({label: gateway}, {label: info})."""
+    base, qubits, is_sim, label = qc_labels(cfg)
+    gw = SimGateway(base, qubits, cfg["qaoa"]["seed"]) if is_sim else QuantumInspireGateway(base, cfg["quantum_inspire"])
+    print(f"Connecting to {'local simulator' if is_sim else 'Quantum Inspire'} backend {base} ...")
+    info = gw.connect()
+    if info["qubits"] != qubits:
+        print(f"  WARNING: platform reports {info['qubits']} qubits for {base} (expected {qubits}); using {info['qubits']}.")
+    gw.k = window_size(cfg["qaoa"]["k"], info["qubits"])
+    kind = (f"REAL QUANTUM HARDWARE (platform is_hardware = True, status: {info.get('backend_status')})"
+            if info.get("is_hardware") else "SIMULATION - NOT a quantum computer")
+    print(f"  {info['name']}: {info['qubits']} qubits -> window size k = {gw.k} ({gw.k ** 2} qubits used)\n  -> {kind}")
+    if info.get("is_hardware") and info.get("backend_status") in ("offline", "maintenance"):
+        print(f"  WARNING: backend status is '{info['backend_status']}'; jobs will wait until it is available.")
+    write_json_atomic(out / "backends.json", {label: info})
+    return {label: gw}, {label: info}
+
+
+def preflight(cfg, approach, routes, k, b):
+    n = [r["n_nodes"] for r in routes]
+    if approach == "ORtoolsOutput":
+        f = cfg["ortools_full"]
+        print(f"  {len(routes)} route(s) ({min(n)}-{max(n)} nodes); at most {len(routes) * f['time_limit_s'] / 60:.0f} min "
+              f"({f['time_limit_s']:g} s per route, {f['workers']} workers, no start solution).")
+    elif approach == "AlgorithmWithORtoolCore":
+        w = sum(math.ceil((m - 1) / b) for m in n)
+        print(f"  {len(routes)} route(s) ({min(n)}-{max(n)} nodes), k = {k}, b = {b}: {w} windows solved by CP-SAT.")
+    else:
+        w = sum(math.ceil((m - 1) / b) for m in n)
+        print(f"  {len(routes)} route(s) ({min(n)}-{max(n)} nodes), k = {k}, b = {b}: about {w} quantum jobs in total, "
+              f"{max(math.ceil((m - 1) / b) for m in n)} sequential jobs on the longest route.")
+
+
+def run_approach(cfg, routes, hashes, approach, root):
+    """Returns (state, engine) with state in finished | failed | stopped | error."""
+    out = root / approach
+    k, b = algorithm_window(cfg)
+    print(f"\n=== {approach} ===")
+    preflight(cfg, approach, routes, k, b)
+    try:
+        check_experiment_file(cfg, approach, out, hashes)
     except ConfigError as e:
         print(f"ERROR: {e}")
-        return 1
-
-    # ---- connect to the back-ends (Quantum Inspire or local simulation)
+        return "error", None
     gws, infos = {}, {}
-    try:
-        for name in cfg["quantum_inspire"]["backends"]:
-            base, qubits, is_sim = parse_backend(name)
-            label = f"sim-{base}" if is_sim else base
-            gw = SimGateway(base, qubits, cfg["qaoa"]["seed"]) if is_sim else QuantumInspireGateway(base, cfg["quantum_inspire"])
-            print(f"Connecting to {'local simulator' if is_sim else 'Quantum Inspire'} backend {base} ...")
-            info = gw.connect()
-            if info["qubits"] != qubits:
-                print(f"  WARNING: platform reports {info['qubits']} qubits for {base} (expected {qubits}); using {info['qubits']}.")
-            gw.k = window_size(cfg["qaoa"]["k"], info["qubits"])
-            gws[label], infos[label] = gw, info
-            kind = (f"REAL QUANTUM HARDWARE (platform is_hardware = True, status: {info.get('backend_status')})"
-                    if info.get("is_hardware") else "SIMULATION - NOT a quantum computer")
-            print(f"  {info['name']}: {info['qubits']} qubits -> window size k = {gw.k} ({gw.k ** 2} qubits used)\n"
-                  f"  -> {kind}")
-            if info.get("is_hardware") and info.get("backend_status") in ("offline", "maintenance"):
-                print(f"  WARNING: backend status is '{info['backend_status']}'; jobs will wait until it is available.")
-    except AuthError as e:
-        print(f"ERROR: {e}")
-        return 1
-    except (ConfigError, RuntimeError) as e:
-        print(f"ERROR: {e}")
-        return 1
-    write_json_atomic(out / "backends.json", infos)
-    write_json_atomic(exp_path, exp)
-
-    eng = Engine(cfg, routes, gws, out)
+    if approach == "AlgorithmWithQC":
+        try:
+            if qc_all_finished(cfg, routes, out):
+                base, qubits, is_sim, label = qc_labels(cfg)
+                infos = read_json(out / "backends.json")
+                gws = {label: SimpleNamespace(k=k, name=base, kind="offline", info=infos.get(label, {}))}
+            else:
+                gws, infos = connect_qc(cfg, out)
+        except AuthError as e:
+            print(f"ERROR: {e}")
+            return "error", None
+        except (ConfigError, RuntimeError) as e:
+            print(f"ERROR: {e}")
+            return "error", None
+    eng = Engine(cfg, routes, gws, out, approach=approach)
     eng.create_runs()
-    for r in eng.runs:                                    # retry runs that stopped on a failed job
+    for r in eng.runs:                                    # retry runs that stopped on a failure
         if r["status"] == "failed":
             print(f"Retrying failed run {r['name']}: {r['failure']}")
             r["status"], r["failure"] = "running", None
@@ -95,31 +158,57 @@ def main() -> int:
                     if not j["done"]:
                         j["attempt"] = 1
             eng.save(r)
-    n_unfinished = sum(r["status"] == "running" for r in eng.runs)
-    print(f"\n{len(routes)} route(s), {len(eng.runs)} run(s), {n_unfinished} still to do. "
-          f"Jobs are polled every {cfg['quantum_inspire']['poll_interval_s']} s; "
-          "this program waits until they return (Ctrl+C is safe, `python main.py` resumes).\n")
+    todo = sum(r["status"] == "running" for r in eng.runs)
+    print(f"  {len(eng.runs)} run(s), {todo} still to do." + (
+        f" Jobs are polled every {cfg['quantum_inspire']['poll_interval_s']} s; this program waits until they return "
+        "(Ctrl+C is safe, `python main.py` resumes)." if approach == "AlgorithmWithQC" and todo else ""))
     try:
         eng.run_all()
     except AuthError as e:
         print(f"\nERROR: {e}\nProgress is saved. After logging in, run: python main.py")
-        return 1
+        return "error", eng
     except KeyboardInterrupt:
         print("\nStopped. All progress and job IDs are saved. To resume, run: python main.py")
-        return 0
-
-    results_dir, warn = report.build_report(cfg, routes, eng.runs, out, infos)
+        return "stopped", eng
+    # ---- results of this approach, in its own folder
+    if approach == "ORtoolsOutput":
+        experiment.build_ortools_report(cfg, routes, eng.runs, out)
+    elif approach == "AlgorithmWithORtoolCore":
+        experiment.build_core_report(cfg, routes, eng.runs, out)
+    else:
+        baseline = experiment.ortools_by_route(experiment.load_runs(root / "ORtoolsOutput"))
+        report.build_report(cfg, routes, eng.runs, out, infos, ortools=baseline)
     failed = [r for r in eng.runs if r["status"] == "failed"]
-    if failed:
-        print("\nATTENTION: some runs did not complete:")
-        for r in failed:
-            print(f"  {r['name']}: {r['failure']}")
-        print(f"Partial results: {results_dir}/\nAfter fixing the cause, run: python main.py")
+    for r in failed:
+        print(f"ATTENTION {approach}: {r['name']} on {r['route_id'][:22]}: {r['failure']}")
+    print(f"  results: {out / 'results'}/")
+    return ("failed" if failed else "finished"), eng
+
+
+def main() -> int:
+    try:
+        cfg = load_config("config.toml")
+        routes = load_routes(cfg["prepare"]["input_dir"])
+        algorithm_window(cfg)                              # fail fast on an impossible window size
+    except (ConfigError, FileNotFoundError) as e:
+        print(f"ERROR: {e}")
+        return 1
+    root = Path(cfg["output"]["output_dir"])
+    hashes = route_hashes(cfg["prepare"]["input_dir"])
+    print(f"{len(routes)} route(s) from {cfg['prepare']['input_dir']}/; approaches: {', '.join(cfg['experiment']['approaches'])}")
+    any_failed = False
+    for approach in cfg["experiment"]["approaches"]:
+        state, _ = run_approach(cfg, routes, hashes, approach, root)
+        if state in ("error", "stopped"):
+            return 1 if state == "error" else 0
+        any_failed |= state == "failed"
+    comp = experiment.build_comparison(cfg, routes, root)
+    if comp:
+        print(f"\nComparison across approaches: {comp}/  (paired_comparison.csv, statistics.md, figures/)")
+    if any_failed:
+        print("\nATTENTION: some runs did not complete. After fixing the cause, run: python main.py")
         return 2
-    print(f"\nFINISHED\n\nAll runs are complete. Results: {results_dir}/")
-    print("  summary.md  comparison.csv  windows.csv  jobs_ledger.csv  results.json  figures/")
-    if warn:
-        print(f"WARNING: {warn}")
+    print("\nFINISHED\n\nAll requested approaches are complete.")
     return 0
 
 

@@ -87,13 +87,14 @@ def _pct(a, b):
     return None if a is None or b is None or not a else 100.0 * (a - b) / a
 
 
-def comparison_table(routes, runs, labels_k):
-    """One row per route; columns per QPU label."""
+def comparison_table(routes, runs, labels_k, ortools=None):
+    """One row per route; columns per QPU label. `ortools`: {route_id: {cost, status, lower_bound, wall_time_s}} from the
+    ORtoolsOutput approach (if it has been run)."""
     by = _runs_by(runs)
     rows = []
     for rid, route in routes.items():
         rr = by.get(rid, {})
-        orr = route.get("ortools") or {}
+        orr = (ortools or {}).get(rid) or route.get("ortools") or {}
         row = {"route_id": rid, "n_stops": route["n_nodes"], "amazon_cost": route["amazon_cost"],
                "ortools_cost": orr.get("cost"), "ortools_status": orr.get("status"),
                "ortools_lower_bound": orr.get("lower_bound"), "ortools_wall_s": orr.get("wall_time_s"),
@@ -151,6 +152,11 @@ def window_table(runs):
                          "two_qubit_gates": tr.get("two_qubit_gates"),
                          "turnaround_s": jt.get("turnaround_s"), "queue_wait_platform_s": jt.get("queue_wait_platform_s"),
                          "job_created_platform": plat.get("job_created_on"), "job_finished_platform": plat.get("job_finished_at"),
+                         "ortools_window_cost": w.get("ortools_window_cost"),
+                         "ortools_window_status": w.get("ortools_window_status"),
+                         "ortools_matches_bruteforce": w.get("ortools_matches_bruteforce"),
+                         "excess_over_ortools_pct": (100.0 * (w["window_cost"] - w["ortools_window_cost"]) / w["ortools_window_cost"]
+                                                     if w.get("ortools_window_cost") else None),
                          "backend": job.get("backend"), "backend_is_hardware": job.get("backend_is_hardware"),
                          "platform_backend_is_hardware": plat.get("batch_backend_is_hardware"),
                          "platform_backend_type": plat.get("batch_backend_type_name")})
@@ -244,7 +250,7 @@ def summary_markdown(cmp_df, win_df, labels_k, cfg, runs, backends_info) -> str:
 
 
 # --------------------------------------------------------------------------- figures
-def make_figures(routes, runs, labels_k, out_dir: Path, cfg: dict, log=print):
+def make_figures(routes, runs, labels_k, out_dir: Path, cfg: dict, log=print, ortools=None):
     fig_dir = Path(out_dir) / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     by = _runs_by(runs)
@@ -252,7 +258,8 @@ def make_figures(routes, runs, labels_k, out_dir: Path, cfg: dict, log=print):
     for n_done, (rid, route) in enumerate(routes.items()):
         rr = by.get(rid, {})
         bars = [("Amazon\nplanned", route["amazon_cost"], figures.PATH_COLORS["amazon"])]
-        orr = route.get("ortools") or {}
+        orr = (ortools or {}).get(rid) or route.get("ortools") or {}
+        route = {**route, "ortools": orr}
         if orr.get("cost") is not None:
             bars.append(("OR-Tools", orr["cost"], figures.PATH_COLORS["ortools"]))
         if rr.get("nn") and rr["nn"].get("result"):
@@ -281,7 +288,7 @@ def make_figures(routes, runs, labels_k, out_dir: Path, cfg: dict, log=print):
             figures.scaling_plot(rows, fig_dir)
 
 
-def build_report(cfg, routes_list, runs, out_dir, backends_info, log=print):
+def build_report(cfg, routes_list, runs, out_dir, backends_info, log=print, ortools=None):
     out = Path(out_dir) / "results"
     out.mkdir(parents=True, exist_ok=True)
     routes = {r["route_id"]: r for r in routes_list}
@@ -289,7 +296,7 @@ def build_report(cfg, routes_list, runs, out_dir, backends_info, log=print):
     for r in runs:
         if r["mode"] == "qpu":
             labels_k[r["name"]] = (r["k"], r["p"])
-    cmp_df = comparison_table(routes, runs, labels_k)
+    cmp_df = comparison_table(routes, runs, labels_k, ortools)
     win_df = window_table(runs)
     cmp_df.to_csv(out / "comparison.csv", index=False)
     win_df.to_csv(out / "windows.csv", index=False)
@@ -302,7 +309,7 @@ def build_report(cfg, routes_list, runs, out_dir, backends_info, log=print):
     warn = None
     if cfg["output"]["figures"]:
         try:
-            make_figures(routes, runs, labels_k, out, cfg, log)
+            make_figures(routes, runs, labels_k, out, cfg, log, ortools)
         except Exception as e:                                           # figures must never lose results
             warn = f"figures were not created ({type(e).__name__}: {e})"
     return out, warn

@@ -71,7 +71,7 @@ def platform_report(runs, resource_manager_cls=None):
 
 def main() -> int:
     cfg = load_config(Path(__file__).resolve().parents[1] / "config.toml")
-    out = Path(__file__).resolve().parents[1] / cfg["output"]["output_dir"]
+    out = Path(__file__).resolve().parents[1] / cfg["output"]["output_dir"] / "AlgorithmWithQC"
     runs = collect(out)
     if not runs:
         print(f"No QPU runs found in {out}/runs/.")

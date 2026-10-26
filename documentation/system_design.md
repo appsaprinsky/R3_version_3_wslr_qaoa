@@ -1,5 +1,11 @@
 # System design
 
+> Updated for the three-approach experiment. The experimental protocol and every fairness decision are in `methodology.md`.
+> `main.py` now runs `ORtoolsOutput`, `AlgorithmWithORtoolCore` and `AlgorithmWithQC` one after another, each with its own `Engine`,
+> state folder (`output/<approach>/runs`), `experiment.json` (settings fingerprint + route hashes) and results; `Comparison/` reads them.
+> New modules: `experiment.py` (reports + paired comparison). `ortools_solver.py` now also provides `solve_window` and an anytime trace.
+> `prepare_input.py` no longer calls OR-Tools; it only prepares routes (seeded, nested, with an exclusion list).
+
 Scope: one algorithm, **Warm-Start Linear-Ramp Receding-Horizon QAOA**, run on Quantum Inspire Tuna-5/9/17
 over Amazon last-mile routes. Mathematics: `paper.pdf` (every formula there is what the code implements).
 No quantum advantage is claimed.

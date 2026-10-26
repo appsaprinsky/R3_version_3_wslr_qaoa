@@ -1,7 +1,12 @@
-# WS-LR-QAOA for the Open TSP on Quantum Inspire (Tuna-5 / Tuna-9 / Tuna-17)
+# Three-approach comparison on Amazon last-mile routes (Tuna-17)
 
-Warm-Start Linear-Ramp Receding-Horizon QAOA on Amazon last-mile routes.
-Design and maths: `documentation/system_design.md`, `documentation/paper.pdf`.
+| Approach (output folder) | What is solved how |
+|---|---|
+| `ORtoolsOutput` | the whole route, by OR-Tools CP-SAT (no start solution) |
+| `AlgorithmWithORtoolCore` | my receding-horizon algorithm; every window solved by OR-Tools CP-SAT |
+| `AlgorithmWithQC` | my receding-horizon algorithm; every window sampled on the Tuna-17 quantum computer |
+
+Same routes, same cost function, one run per route and approach. Methodology and all decisions: `documentation/methodology.md`.
 
 ## 1. Install (once)
 
@@ -11,31 +16,24 @@ source .venv/bin/activate
 pip install -r requirements.txt
 qi login
 ```
-If login fails, try
-```bash
-python -m pip install --upgrade certifi
-export SSL_CERT_FILE="$(python -c 'import certifi; print(certifi.where())')"
-export REQUESTS_CA_BUNDLE="$SSL_CERT_FILE"
-```
 
-Download the Amazon Last Mile Routing Research Challenge training data
-(https://routingchallenge.mit.edu/), unzip it into `data/`, and check that this exists:
+Download the Amazon Last Mile Routing Research Challenge training data (https://routingchallenge.mit.edu/), unzip it into `data/`:
 
 ```bash
 ls data/almrrc2021-data-training/model_build_inputs/
 # route_data.json  travel_times.json  actual_sequences.json  ...
 ```
 
-## 2. Prepare the input (once per sample)
+## 2. Prepare the routes
 
-Set the sample in `config.toml` under `[prepare]` (`num_routes`, `seed`, optional `min_stops` / `max_stops`), then:
+`config.toml` -> `[prepare]`: `num_routes`, `seed`, `exclude_route_ids`. There is no size filter on purpose.
 
 ```bash
 python prepare_input.py
 ```
 
-This selects random Amazon routes (seeded, reproducible), saves them with their actual Amazon cost
-and an OR-Tools solution to `input/`.
+Saves the seeded random routes (matrix, Amazon sequence and cost) to `input_eval/`. To use more routes later, raise `num_routes`
+and run it again: the sample is nested (existing routes stay, new ones are added).
 
 ## 3. Run
 
@@ -43,47 +41,43 @@ and an OR-Tools solution to `input/`.
 python main.py
 ```
 
-`main.py` reads `input/`, submits the circuits to Tuna-5, Tuna-9 and Tuna-17, **waits until the jobs
-return** (polling, no timeout), advances the algorithm, and writes `output/results/`.
-It can be stopped at any time (Ctrl+C, closed laptop). Run the same command again to resume.
+Runs the approaches listed in `[experiment] approaches` one after another (never at the same time, so timings are not disturbed).
+For `AlgorithmWithQC` it waits until the Tuna-17 jobs return. Stop it any time (Ctrl+C) and run the same command again to resume;
+finished work is never recomputed. After raising `num_routes`, `python main.py` adds the new routes to every approach.
 
-Defaults: 1 route, 1 run per QPU, `p = 2`, 1024 shots. All parameters are in `config.toml`.
+Dry run without a quantum computer: `backends = ["sim:Tuna-17"]` in `config.toml` (a local sampler, labelled SIMULATION).
 
 ## 4. Results
 
-```bash
-cat output/results/summary.md
+```
+output_eval/
+  ORtoolsOutput/results/             results.csv  anytime_trace.csv  summary.md  figures/
+  AlgorithmWithORtoolCore/results/   results.csv  windows.csv  summary.md  figures/
+  AlgorithmWithQC/results/           comparison.csv  windows.csv  jobs_ledger.csv  summary.md  figures/
+  Comparison/                        paired_comparison.csv  statistics.md  statistics.json  figures/
 ```
 
-| File (`output/results/`) | Content |
-|---|---|
-| `summary.md` | Amazon vs OR-Tools vs Tuna-5/9/17, classical counterparts, window diagnostics |
-| `comparison.csv` | one row per route (all costs, improvements, gaps) |
-| `windows.csv` | one row per window (valid-shot fraction, TVD, regret, job ids, transpiled depth) |
-| `jobs_ledger.csv` | every Quantum Inspire job id |
-| `figures/routes/<route>/` | **one picture per path**, with and without depot: Amazon, OR-Tools, every run (PNG + PDF) |
-| `figures/subroutes/<route>/<run>/` | one picture per QPU window: **blue** = order decoded from the QPU, **red** = part committed to the route (`visualise_subroute` in `config.toml`) |
-| `figures/` | also `cost_comparison__*` bars and `scaling` plot |
+```bash
+cat output_eval/Comparison/statistics.md
+```
+
+Each approach folder also holds `runs/` (full state), `experiment.json` (settings, versions) and, for the QC approach, `backends.json`.
+`AlgorithmWithQC/results/figures/subroutes/` shows every window: blue = order decoded from the QPU, red = part committed
+(`visualise_subroute`).
 
 ## Check that real hardware was used
 
-`main.py` prints `REAL QUANTUM HARDWARE` or `SIMULATION` for every backend and refuses a Quantum Inspire backend that the
-platform does not flag as hardware. To verify a finished experiment against the platform:
+`main.py` prints `REAL QUANTUM HARDWARE` for Tuna-17 and refuses a backend the platform does not flag as hardware. To re-check a finished run:
 
 ```bash
 python scripts/verify_hardware.py
 ```
 
-## Dry run without a QPU (no account needed)
-
-In `config.toml` set `backends = ["sim:Tuna-9"]`, delete `output/`, then `python main.py`.
-
-## Start a new experiment
+## Start again
 
 ```bash
-rm -rf output          # keeps input/
-# or, for a new route sample:
-rm -rf input output && python prepare_input.py
+rm -rf output_eval/AlgorithmWithQC      # one approach only
+rm -rf output_eval                    # everything (keeps input_eval/)
 ```
 
 ## Tests
@@ -97,6 +91,7 @@ python -m pytest tests -q
 | Message | Do |
 |---|---|
 | `Quantum Inspire is not logged in or the login expired. Run: qi login` | `qi login`, then `python main.py` |
-| `config.toml or input/ changed since this experiment was started` | restore the old settings, or `rm -rf output` |
-| `ATTENTION ... failed` | `python main.py` retries failed runs; see `output/runs/*.json` |
-| waiting a long time | normal (shared queue); leave it running or Ctrl+C and rerun later |
+| `The settings of <approach> changed since it was started` | restore the old `config.toml` values, or `rm -rf output_eval/<approach>` |
+| `Route file(s) changed` | restore `input_eval/`, or `rm -rf output_eval/<approach>` |
+| `CP-SAT did not prove the window optimal` | raise `[ortools_core] window_time_limit_s`; `python main.py` retries |
+| waiting a long time on Tuna-17 | normal (shared queue); leave it running or Ctrl+C and rerun later |

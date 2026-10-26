@@ -51,3 +51,11 @@ def input_fingerprint(input_dir) -> str:
     for f in sorted(Path(input_dir).glob("route_*.json")):
         h.update(f.name.encode()); h.update(f.read_bytes())
     return h.hexdigest()[:16]
+
+
+def route_hashes(input_dir) -> dict:
+    """SHA-256 prefix of every prepared route file, keyed by route id (detects edited routes; new routes may be added)."""
+    out = {}
+    for f in sorted(Path(input_dir).glob("route_*.json")):
+        out[read_json(f)["route_id"]] = hashlib.sha256(f.read_bytes()).hexdigest()[:16]
+    return out

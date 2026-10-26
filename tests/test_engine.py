@@ -16,6 +16,7 @@ def make_cfg(**qaoa):
     cfg = load_config(ROOT / "config.toml")
     cfg["qaoa"].update({"ramp_grid": 3, "ramp_maxiter": 25, "shots": 512, **qaoa})
     cfg["quantum_inspire"]["poll_interval_s"] = 0
+    cfg["compare"].update(ideal_simulation=True, exact_window=True, warm_start_only=True, nearest_neighbor=True)
     return cfg
 
 

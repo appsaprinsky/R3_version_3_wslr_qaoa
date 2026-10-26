@@ -88,10 +88,12 @@ def build_route(route_id, route_data, travel_times, actual_sequences):
 
 
 def sample_routes(route_data, travel_times, actual_sequences, num_routes, seed, min_stops=0, max_stops=0,
-                  log=print):
+                  log=print, exclude=()):
     """Uniform sample without replacement (seeded). Invalid routes are skipped and the next one in the
-    seeded permutation is used, so the same (seed, filters) always give the same routes."""
-    ids = sorted(set(travel_times) & set(route_data))
+    seeded permutation is used, so the same (seed, exclusion list) always gives the same routes, and the sample for
+    N routes is the first N of the sample for any larger N (nested). min_stops/max_stops exist for exploratory use
+    only; the experiment configuration does not expose them. `exclude` removes route ids (e.g. the pilot route)."""
+    ids = sorted((set(travel_times) & set(route_data)) - set(exclude))
     if min_stops or max_stops:
         ids = [r for r in ids if (not min_stops or len(route_data[r]["stops"]) >= min_stops)
                and (not max_stops or len(route_data[r]["stops"]) <= max_stops)]

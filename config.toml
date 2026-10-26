@@ -1,54 +1,76 @@
 # ============================================================================
 #  config.toml -- the only place where parameters are set.
-#  prepare_input.py reads [prepare]; main.py reads [qaoa], [quantum_inspire],
-#  [compare] and [output]. Unknown keys are rejected.
+#  prepare_input.py reads [prepare]; main.py reads everything else. Unknown keys are rejected.
+#
+#  Three approaches are run on the SAME routes, one after another, each in its own folder:
+#    ORtoolsOutput            the whole route solved by OR-Tools CP-SAT
+#    AlgorithmWithORtoolCore  my algorithm, every window solved by OR-Tools CP-SAT
+#    AlgorithmWithQC          my algorithm, every window sampled on the Tuna-17 quantum computer
+#  Methodology and the reasons for every setting: documentation/methodology.md
 # ============================================================================
 
 [prepare]
-data_dir   = "data/almrrc2021-data-training"  # folder that contains (or contains model_build_inputs/ with)
-                                              # route_data.json, travel_times.json, actual_sequences.json
-input_dir  = "input"
-num_routes = 1            # how many random Amazon routes to use
-seed       = 2026         # seed of the random route selection (reproducible)
-min_stops  = 0            # optional filter on the number of stops incl. depot (0 = off)
-max_stops  = 0            # e.g. 40 keeps the first run short (0 = off)
-ortools_time_limit_s = 120   # OR-Tools CP-SAT time limit per route
-ortools_workers      = 8
+data_dir   = "data/almrrc2021-data-training"
+input_dir  = "input_eval"
+num_routes = 3            # first run: 3 routes (probe). The sample is NESTED: raising this later only ADDS routes
+                          # (run prepare_input.py again, then main.py); routes already done are kept.
+seed       = 2027         # seed of the random route selection. No size filter exists on purpose.
+exclude_route_ids = ["RouteID_7c36b9b2-3084-46eb-9b45-0309ec4b0d19"]   # the pilot route (used to choose settings)
 
+[experiment]
+approaches = ["ORtoolsOutput", "AlgorithmWithORtoolCore", "AlgorithmWithQC"]   # any subset; each is independent.
+# They run one after another, never at the same time, so that the timings do not disturb each other.
+
+# ---- Approach 1: whole route by CP-SAT -------------------------------------------------------------------------
+[ortools_full]
+time_limit_s = 120.0      # wall-clock limit per route; the solver also stops when optimality is proven
+workers      = 8          # CP-SAT worker threads (the algorithms are single-threaded: compare CPU time as well)
+seed         = 2026
+relative_gap_limit = 0.0  # 0 = stop only at proven optimality or at the time limit
+cost_scale   = 100        # CP-SAT works on integers: cost x 100 rounded (0.01 s); reported costs are unrounded
+# No start solution (hint) is ever given.
+
+# ---- Approach 2: my algorithm with CP-SAT as window solver ----------------------------------------------------
+[ortools_core]
+window_time_limit_s = 10.0   # per window; a window that is not proven optimal makes the run fail (never silently)
+cost_scale   = 1000
+workers      = 1             # deterministic
+seed         = 2026
+verify_qc_windows = true     # also solve every window the QC run visits with CP-SAT (diagnostic, excluded from QC timing)
+
+# ---- Settings of my algorithm (AlgorithmWithQC; k and batch_size are shared with AlgorithmWithORtoolCore) ----------
 [qaoa]
-k          = "auto"       # window size; "auto" = largest k with k^2 <= qubits (Tuna-5: 2, Tuna-9: 3, Tuna-17: 4)
-p          = 2            # number of QAOA layers (ramp has 2 free parameters for any p)
+k          = "auto"       # window size; "auto" = largest k with k^2 <= qubits = 4 on Tuna-17
+p          = 2            # QAOA layers
 batch_size = 0            # nodes committed per window (b <= k); 0 = k
 exploration = 0.0         # fraction of window candidates drawn at random instead of nearest
 shots      = 1024
 seed       = 2026
-penalty_lambda = 1.5      # P = lambda * k * max edge cost of the window (must be > 1)
-epsilon    = 0.25         # warm-start regularisation: LP solution clipped to [eps, 1-eps]; 0.5 = no warm start
-decode_rule = "marginal"   # "marginal": order maximising the summed marginals; "best_valid": cheapest valid sampled permutation
-lp_cost    = "surrogate"  # "surrogate" (linear surrogate cost) or "linearized" (LP relaxation of the quadratic cost)
-ramp_mode  = "optimize"   # "optimize": tune (delta_gamma, delta_beta) per window on the exact simulator
-                          # "fixed":    use delta_gamma / delta_beta below, no simulation needed
+penalty_lambda = 1.5
+epsilon    = 0.25         # warm-start regularisation (0.5 = no warm start)
+decode_rule = "marginal"
+lp_cost    = "surrogate"
+ramp_mode  = "optimize"   # tune (delta_gamma, delta_beta) per window on the exact simulator
 delta_gamma = 1.0
 delta_beta  = 1.0
-ramp_grid    = 7          # grid points per axis before COBYLA
-ramp_maxiter = 100        # COBYLA iterations
+ramp_grid    = 7
+ramp_maxiter = 100
 
 [quantum_inspire]
-backends = ["Tuna-17"]   # prefix with "sim:" (e.g. "sim:Tuna-9") for a local simulation ["Tuna-5", "Tuna-9", "Tuna-17"] 
-poll_interval_s  = 30     # seconds between status checks; main.py never gives up waiting
-max_job_retries  = 3      # resubmissions of a failed/cancelled job
-optimization_level = 3    # transpiler settings as in the reference script
+backends = ["Tuna-17"]    # exactly one backend. "sim:Tuna-17" = local noiseless sampler for dry runs (NOT a quantum computer)
+poll_interval_s  = 30
+max_job_retries  = 3
+optimization_level = 3
 transpile_seed     = 7
 
-[compare]                 # classical counterparts that run locally at the same k
-ideal_simulation = true   # same algorithm, exact circuit probabilities instead of device counts
-exact_window     = true   # each window solved exactly (brute force) instead of by QAOA
-warm_start_only  = true   # decode the warm start itself (no QAOA layers): what does the QAOA add?
-nearest_neighbor = true   # nearest neighbour + 2-opt (window size 1)
+[compare]                 # optional controls, computed inside the AlgorithmWithQC folder
+nearest_neighbor = true   # nearest neighbour + 2-opt: the classical heuristic of equal complexity
+ideal_simulation = false
+exact_window     = false
+warm_start_only  = false
 
 [output]
-output_dir = "output"
+output_dir = "output_eval" # -> output_eval/ORtoolsOutput, .../AlgorithmWithORtoolCore, .../AlgorithmWithQC, .../Comparison
 figures    = true
-visualise_subroute = true   # true: one picture per QPU window (blue = order decoded from the QPU, red = part committed)
-                            # false: skip them (TOML booleans are lowercase)
-figure_max_routes  = 15      # route and sub-route pictures are made for the first N routes only (cost bars for all)
+visualise_subroute = true # AlgorithmWithQC: one picture per window (blue = QPU-decoded order, red = committed part)
+figure_max_routes  = 5    # route / sub-route pictures only for the first N routes

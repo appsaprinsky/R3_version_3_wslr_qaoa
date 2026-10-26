@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Step 1: select random Amazon routes (seeded) and save them to input/.  Usage: python prepare_input.py
 
-Reads [prepare] from config.toml. Saves per route: cost matrix, Amazon planned sequence and cost,
-coordinates (plots only) and the OR-Tools CP-SAT solution. main.py reads only from input/.
+Reads [prepare] from config.toml. Saves per route: cost matrix, Amazon planned sequence and cost, coordinates (plots only).
+The sample has no size filter. It is nested: with the same seed and exclusion list, a larger num_routes only ADDS routes,
+so you can start with a few routes and extend later; re-running this command adds the missing routes to input/.
+Solving is not done here: the OR-Tools baseline is an approach of main.py (same framework, same timing).
 """
-import json
-import os
 import platform
 import sys
 import time
@@ -13,10 +13,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-import numpy as np
-from wslrqaoa import amazon, ortools_solver, routing
+from wslrqaoa import amazon
 from wslrqaoa.config import load_config, ConfigError
-from wslrqaoa.io_utils import write_json_atomic
+from wslrqaoa.io_utils import write_json_atomic, read_json
 
 
 def main() -> int:
@@ -27,41 +26,55 @@ def main() -> int:
         print(f"ERROR: {e}")
         return 1
     out = Path(cfg["input_dir"])
-    if out.exists() and any(out.glob("route_*.json")):
-        print(f"ERROR: '{out}/' already contains routes. Delete the folder (and output/) to prepare a new sample.")
-        return 1
+    manifest_path = out / "manifest.json"
+    have = sorted(out.glob("route_*.json")) if out.exists() else []
+    old = None
+    if have:
+        if not manifest_path.exists():
+            print(f"ERROR: '{out}/' has routes but no manifest.json. Delete the folder to prepare a new sample.")
+            return 1
+        old = read_json(manifest_path)
+        if old["seed"] != cfg["seed"] or sorted(old.get("excluded", [])) != sorted(cfg["exclude_route_ids"]):
+            print(f"ERROR: '{out}/' was prepared with a different seed or exclusion list. Delete the folder (and the "
+                  "output) to prepare a new sample, or restore the old settings to extend it.")
+            return 1
+        if len(have) >= cfg["num_routes"]:
+            print(f"'{out}/' already holds {len(have)} route(s) (num_routes = {cfg['num_routes']}). Nothing to do. "
+                  "Increase num_routes to extend the sample.")
+            return 0
     print(f"Reading Amazon data from {raw_dir} (large files, this can take a minute) ...")
     t0 = time.time()
     route_data, travel_times, actual = amazon.load_raw(raw_dir)
     print(f"  loaded {len(travel_times)} routes in {time.time() - t0:.0f} s")
     routes, skipped = amazon.sample_routes(route_data, travel_times, actual, cfg["num_routes"], cfg["seed"],
-                                           cfg["min_stops"], cfg["max_stops"])
+                                           exclude=cfg["exclude_route_ids"])
     del route_data, travel_times, actual
+    ids = [r["route_id"] for r in routes]
+    if old is not None and ids[:len(old["route_ids"])] != old["route_ids"]:
+        print("ERROR: the existing routes are not a prefix of the sample for this seed (raw data changed?). Aborting.")
+        return 1
     out.mkdir(parents=True, exist_ok=True)
+    new = 0
     for rec in routes:
-        C = np.array(rec["cost_matrix"])
+        path = out / f"route_{rec['route_id']}.json"
+        if path.exists():
+            continue
         print(f"Route {rec['route_id']}: {rec['n_nodes']} nodes, Amazon planned cost = {rec['amazon_cost']:.1f}")
         if rec["repairs"]:
             print("  repairs:", "; ".join(rec["repairs"]))
-        print(f"  OR-Tools CP-SAT (time limit {cfg['ortools_time_limit_s']} s) ...")
-        nn2 = routing.two_opt(C, routing.nearest_neighbor_tour(C))          # start solution for the solver
-        hint = min((rec["amazon_sequence"], nn2), key=lambda t: routing.open_cost(C, t))
-        res = ortools_solver.solve_open_tsp(C, 0, cfg["ortools_time_limit_s"], cfg["ortools_workers"], hint_tour=hint)
-        res["hint"] = "amazon" if hint is rec["amazon_sequence"] else "nearest_neighbor_2opt"
-        rec["ortools"] = res
-        if res["cost"] is not None:
-            print(f"  OR-Tools cost = {res['cost']:.1f} ({res['status']}, lower bound {res['lower_bound']:.1f})")
-        write_json_atomic(out / f"route_{rec['route_id']}.json", rec)
+        write_json_atomic(path, rec)
+        new += 1
     manifest = {
-        "schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "seed": cfg["seed"], "num_routes": cfg["num_routes"], "min_stops": cfg["min_stops"],
-        "max_stops": cfg["max_stops"], "route_ids": [r["route_id"] for r in routes],
+        "schema_version": 2, "created_utc": (old or {}).get("created_utc") or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "updated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "seed": cfg["seed"], "excluded": list(cfg["exclude_route_ids"]), "num_routes": cfg["num_routes"],
+        "route_ids": ids, "n_nodes": {r["route_id"]: r["n_nodes"] for r in routes},
         "skipped": [{"route_id": r, "reason": w} for r, w in skipped],
         "raw_dir": str(raw_dir), "raw_sha256": {f: amazon.sha256_file(raw_dir / f) for f in amazon.RAW_FILES},
         "python": platform.python_version(),
     }
-    write_json_atomic(out / "manifest.json", manifest)
-    print(f"\nSaved {len(routes)} route(s) to {out}/. Next: python main.py")
+    write_json_atomic(manifest_path, manifest)
+    print(f"\nSaved {new} new route(s) to {out}/ ({len(ids)} in total). Next: python main.py")
     return 0
 
 
